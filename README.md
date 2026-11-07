@@ -119,5 +119,4 @@ Inspired by the Chrome Dino game made by the Google Chrome team. All the drawing
 
 ## Author
 
-**Khoi Cao Tran**, Computer Science student at Seattle University
-GitHub: [@khoicaotran](https://github.com/khoicaotran)
+**Khoi Cao Tran**, Computer Science student at Seattle University | GitHub: [@khoicaotran](https://github.com/khoicaotran)
