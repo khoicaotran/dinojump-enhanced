@@ -14,3 +14,7 @@ Thumbs.db
 
 # JavaScript dependencies (if added later)
 node_modules/
+
+# Local save data (changes every time you play)
+scores.txt
+achievements.txt
