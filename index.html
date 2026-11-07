@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DinoJump (Java + HTML)</title>
+<style>
+  :root { --bg: #f3f1e8; --fg: #1c2318; box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+  @media (prefers-color-scheme: dark) { :root { --bg: #15181a; --fg: #e8eee4; } }
+  body { font-family: sans-serif; text-align: center; background: var(--bg); color: var(--fg); margin: 0; padding: 12px; }
+  canvas { width: 100%; max-width: 800px; border: 3px solid #222; border-radius: 6px; }
+  button, select { font: inherit; padding: 6px 12px; margin: 3px; }
+  .on { background: #2e7d32; color: #fff; }
+  table { margin: 0 auto; border-collapse: collapse; }
+  td { padding: 3px 16px; border-bottom: 1px solid #8884; }
+  tr.new { background: #ffeb3b66; font-weight: bold; }
+  ul { list-style: none; padding: 0; margin: 0 auto; max-width: 460px; text-align: left; }
+  li { padding: 3px 0; opacity: .75; }
+  li.done { opacity: 1; font-weight: bold; color: #43a047; }
+</style></head><body>
+<h2>DinoJump (Java + HTML)</h2>
+<div>
+  <button id="b1" class="on" onclick="setMode(1)">1 Player</button>
+  <button id="b2" onclick="setMode(2)">2 Players</button>
+  Level <select id="difficulty"><option value="easy">Easy</option><option value="normal" selected>Normal</option><option value="hard">Hard</option></select>
+  P1 <input id="name0" maxlength="12" placeholder="Player 1" size="9"> <select id="skin0"></select>
+  <span id="p2box" hidden>P2 <input id="name1" maxlength="12" placeholder="Player 2" size="9"> <select id="skin1"></select></span>
+  <button onclick="startGame()">Start</button>
+  <button id="pauseBtn" onclick="togglePause()">Pause (P)</button>
+  <button id="muteBtn" onclick="toggleMute()">Sound: on (M)</button>
+</div>
+<canvas id="c" width="800" height="200"></canvas>
+<p id="help"></p>
+<h3>Top 5 scores</h3>
+<table id="board"><thead><tr><th>#</th><th>Name</th><th>Score</th><th>Level</th></tr></thead><tbody></tbody></table>
+<h3>Achievements</h3>
+<ul id="ach"></ul>
+
+<script>
+// This page only DRAWS the game. All the rules are in the Java code.
+const W = 800, H = 200, GROUND = 160;
+const ctx = document.getElementById('c').getContext('2d');
+const $ = id => document.getElementById(id);
+
+// NET-START: how this page talks to the Java server
+const net = {
+  start: (n, a, b, n0, n1, d) => fetch(`/start?players=${n}&s0=${a}&s1=${b}&n0=${encodeURIComponent(n0)}&n1=${encodeURIComponent(n1)}&d=${d}`),
+  jump:  p => fetch('/jump?p=' + p),
+  duck:  (p, on) => fetch(`/duck?p=${p}&on=${on}`),
+  move:  (p, d) => fetch(`/move?p=${p}&d=${d}`),
+  pause: on => fetch('/pause?on=' + on),
+  state: async () => (await fetch('/state', { cache: 'no-store' })).json()
+};
+// NET-END
+
+const SKIN_NAMES  = ['Rex (balanced)', 'Blaze (quick, low jump)', 'Frosty (floaty, high jump)'];
+const SKIN_COLORS = ['#43a047', '#e53935', '#29b6f6'];
+// Colors of each environment: [sky top, sky bottom, ground, obstacle color]
+const THEMES = [
+  ['#fdf1c7', '#ffe6a0', '#c9a45c', '#2e7d32'],   // 0 Desert Day
+  ['#ff9a62', '#ffd27a', '#a8683a', '#4e342e'],   // 1 Sunset
+  ['#0b1030', '#26306b', '#4a4f6e', '#9ccc65'],   // 2 Night
+  ['#cfe8f7', '#f4fbff', '#e8f1f5', '#5c7c8a'],   // 3 Snow Land
+  ['#2b0a0a', '#7a1d0a', '#3b2220', '#ff7043']    // 4 Volcano
+];
+const CAVE = ['#0f0d14', '#2a2433', '#3a3340', '#b9aecb'];
+
+let mode = 1;                       // 1 or 2 players
+let game = { state: 'menu', players: [], obstacles: [], boss: null, score: 0, paused: false, scores: [], achievements: [], toast: '' };
+let frame = 0, overTime = 0;
+
+SKIN_NAMES.forEach((n, i) => { $('skin0').add(new Option(n, i)); $('skin1').add(new Option(n, i)); });
+$('skin1').value = 1;
+
+function setMode(n) {
+  mode = n;
+  $('b1').classList.toggle('on', n == 1);
+  $('b2').classList.toggle('on', n == 2);
+  $('p2box').hidden = (n == 1);
+  $('help').textContent = n == 1
+    ? 'Jump: Space / W / Up.  Duck: S / Down.  Walk: A, D or Left, Right (dodge meteors and lightning!).  Touch: tap = jump, tap low = duck.'
+    : 'P1: W jump, S duck, A / D walk.   P2: Up jump, Down duck, Left / Right walk.   Highest score wins!';
+}
+setMode(1);
+
+// ---------- smooth transitions (gradient fade between environments and events) ----------
+// Instead of jumping to new colors, we move a little closer to them in every frame.
+const hex = h => [1, 3, 5].map(i => parseInt(h.substr(i, 2), 16));
+const rgb = a => `rgb(${a.map(Math.round)})`;
+const cur = THEMES[0].map(hex);                         // the colors we are drawing right now
+const fade = { storm: 0, meteor: 0, cave: 0, deco: { sun: 1, moon: 0, snow: 0, lava: 0 } };
+const DECO = ['sun', 'sun', 'moon', 'snow', 'lava'];     // which decoration belongs to which environment
+let lastTime = performance.now();
+function blend(dt) {
+  const k = 1 - Math.exp(-dt * 1.6);                     // about 2 seconds to finish a change
+  const target = (game.cave ? CAVE : THEMES[game.theme || 0]).map(hex);
+  cur.forEach((color, i) => color.forEach((v, j) => { color[j] = v + (target[i][j] - v) * k; }));
+  const goal = { storm: game.disaster == 'flood' ? 1 : 0, meteor: game.disaster == 'meteor' ? 1 : 0, cave: game.cave ? 1 : 0 };
+  for (const key in goal) fade[key] += (goal[key] - fade[key]) * k;
+  for (const key in fade.deco) fade.deco[key] += ((!game.cave && DECO[game.theme] == key ? 1 : 0) - fade.deco[key]) * k;
+}
+
+// ---------- sound (made with code, so we need no sound files) ----------
+const Sound = {
+  ctx: null, muted: false,
+  start() {                                              // browsers only allow sound after a click or key press
+    if (!this.ctx) { try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (this.ctx && this.ctx.state == 'suspended') this.ctx.resume();
+  },
+  tone(from, to, secs, type = 'square', vol = 0.1) {     // a beep that slides from one pitch to another
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime, osc = this.ctx.createOscillator(), gain = this.ctx.createGain();
+    osc.type = type; osc.frequency.setValueAtTime(from, t); osc.frequency.exponentialRampToValueAtTime(to, t + secs);
+    gain.gain.setValueAtTime(vol, t); gain.gain.exponentialRampToValueAtTime(0.0001, t + secs);
+    osc.connect(gain); gain.connect(this.ctx.destination); osc.start(t); osc.stop(t + secs);
+  },
+  noise(secs, vol = 0.2, cutoff = 800) {                 // a rumble (thunder, explosion)
+    if (!this.ctx || this.muted) return;
+    const n = Math.floor(this.ctx.sampleRate * secs), buffer = this.ctx.createBuffer(1, n, this.ctx.sampleRate), data = buffer.getChannelData(0);
+    for (let i = 0; i < n; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = this.ctx.createBufferSource(), filter = this.ctx.createBiquadFilter(), gain = this.ctx.createGain();
+    src.buffer = buffer; filter.type = 'lowpass'; filter.frequency.value = cutoff; gain.gain.value = vol;
+    src.connect(filter); filter.connect(gain); gain.connect(this.ctx.destination); src.start();
+  },
+  jump()    { this.tone(300, 700, 0.15); },
+  hurt()    { this.tone(320, 70, 0.3, 'sawtooth', 0.14); },
+  over()    { this.tone(400, 60, 0.9, 'sawtooth', 0.14); },
+  warn()    { this.tone(900, 900, 0.08, 'square', 0.05); },
+  thunder() { this.noise(1.3, 0.4, 500); },
+  crash()   { this.noise(0.5, 0.3, 900); },
+  fire()    { this.tone(500, 140, 0.25, 'sawtooth', 0.07); },
+  win()     { [523, 659, 784].forEach((f, k) => setTimeout(() => this.tone(f, f, 0.18, 'square', 0.08), k * 140)); },
+  roar()    { this.noise(1.0, 0.3, 300); this.tone(120, 60, 0.9, 'sawtooth', 0.12); }
+};
+
+// Compare the old and the new game state and play a sound for what happened
+function playSounds(a, b) {
+  if (b.state == 'over' && a.state == 'play') Sound.over();
+  if (b.toast && b.toast != a.toast) Sound.win();
+  if (a.state != 'play') return;
+  b.players.forEach((p, i) => {
+    const q = a.players[i];
+    if (!q) return;
+    if (q.y == 0 && p.y > 0) Sound.jump();
+    if (p.hearts < q.hearts) Sound.hurt();
+  });
+  const count = (g, type, warn) => g.obstacles.filter(o => o.type == type && o.warn == warn).length;
+  if (count(b, 'lightning', false) > count(a, 'lightning', false)) Sound.thunder();
+  if (count(b, 'lightning', true) > count(a, 'lightning', true) || count(b, 'meteor', true) > count(a, 'meteor', true)) Sound.warn();
+  if (count(b, 'meteor', false) < count(a, 'meteor', false)) Sound.crash();
+  if (count(b, 'fireball', false) + count(b, 'backFireball', false) > count(a, 'fireball', false) + count(a, 'backFireball', false)) Sound.fire();
+  if (b.boss && !a.boss) Sound.roar();
+}
+
+// ---------- buttons, pause and scoreboard ----------
+function togglePause() { if (game.state == 'play') net.pause(game.paused ? 0 : 1); if (document.activeElement) document.activeElement.blur(); }
+function toggleMute() {
+  Sound.muted = !Sound.muted;
+  $('muteBtn').textContent = 'Sound: ' + (Sound.muted ? 'off' : 'on') + ' (M)';
+  if (document.activeElement) document.activeElement.blur();
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden && game.state == 'play' && !game.paused) net.pause(1); });  // auto-pause
+
+let achText = '';
+function renderAchievements() {                          // the list of badges under the scoreboard
+  const list = game.achievements || [], text = JSON.stringify(list);
+  if (text == achText) return;                           // nothing changed
+  achText = text;
+  const ul = $('ach');
+  ul.textContent = '';
+  list.forEach(a => {
+    const done = a.progress >= a.goal, li = document.createElement('li');
+    li.className = done ? 'done' : '';
+    li.textContent = (done ? '\u{1F3C6} ' : '\u{1F512} ') + a.title + ' - ' + a.text + ' (' + Math.min(a.progress, a.goal) + '/' + a.goal + ')';
+    ul.appendChild(li);
+  });
+}
+
+let boardText = '';
+function updateUi() {
+  $('pauseBtn').textContent = game.paused ? 'Resume (P)' : 'Pause (P)';
+  renderAchievements();
+  const scores = game.scores || [], text = JSON.stringify(scores);
+  if (text == boardText) return;                          // the table did not change
+  boardText = text;
+  const body = document.querySelector('#board tbody');
+  body.textContent = '';
+  scores.forEach((e, i) => {
+    const row = body.insertRow();
+    if (e.latest) row.className = 'new';                  // the score of the last game is highlighted
+    [i + 1, e.name, e.score, e.level || 'Normal'].forEach(v => { row.insertCell().textContent = v; });
+  });
+  if (!scores.length) body.insertRow().insertCell().textContent = 'No scores yet. Play a game!';
+}
+
+// ---------- talking to Java ----------
+function startGame() {
+  Sound.start();
+  net.start(mode, $('skin0').value, $('skin1').value, $('name0').value, $('name1').value, $('difficulty').value);
+  if (document.activeElement) document.activeElement.blur();
+}
+
+const KEYS = { KeyW: [0, 'jump'], Space: [0, 'jump'], KeyS: [0, 'duck'], KeyA: [0, 'left'], KeyD: [0, 'right'],
+               ArrowUp: [1, 'jump'], ArrowDown: [1, 'duck'], ArrowLeft: [1, 'left'], ArrowRight: [1, 'right'] };
+const whoPlays = k => (mode == 1 ? 0 : k[0]);   // in 1-player mode every key controls player 1
+
+addEventListener('keydown', e => {
+  if (e.target.tagName == 'INPUT' || e.target.tagName == 'SELECT') return;       // typing a name
+  Sound.start();                                                                  // sound needs a key press or a click first
+  if (e.code == 'KeyP' || e.code == 'Escape') { e.preventDefault(); togglePause(); return; }
+  if (e.code == 'KeyM') { toggleMute(); return; }
+  const k = KEYS[e.code];
+  if (!k) return;
+  e.preventDefault();
+  if (game.paused) return;
+  if (game.state != 'play') {                    // not playing: jump key starts the game
+    if (k[1] == 'jump' && Date.now() - overTime > 500) startGame();
+    return;
+  }
+  if (e.repeat) return;
+  if (k[1] == 'jump') net.jump(whoPlays(k));
+  else if (k[1] == 'duck') net.duck(whoPlays(k), 1);
+  else net.move(whoPlays(k), k[1] == 'left' ? -1 : 1);
+});
+addEventListener('keyup', e => {
+  if (e.target.tagName == 'INPUT') return;
+  const k = KEYS[e.code];
+  if (!k) return;
+  if (k[1] == 'duck') net.duck(whoPlays(k), 0);
+  else if (k[1] != 'jump') net.move(whoPlays(k), 0);
+});
+$('c').addEventListener('pointerdown', e => {   // touch / mouse
+  Sound.start();
+  if (game.paused) { net.pause(0); return; }
+  if (game.state != 'play') { if (Date.now() - overTime > 500) startGame(); return; }
+  const r = $('c').getBoundingClientRect();
+  if ((e.clientY - r.top) / r.height > 0.65) net.duck(0, 1); else net.jump(0);
+});
+addEventListener('pointerup', () => { if (game.state == 'play') net.duck(0, 0); });
+
+// ---------- the drawing loop ----------
+async function loop() {
+  try {
+    const previous = game, now = performance.now();
+    game = await net.state();
+    if (game.state == 'over' && previous.state != 'over') overTime = Date.now();
+    blend(Math.min(0.1, (now - lastTime) / 1000)); lastTime = now;
+    playSounds(previous, game);
+    updateUi();
+    draw();
+  } catch (err) {
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = '18px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('Cannot reach the Java server. Is "java Main" running?', W / 2, H / 2);
+  }
+  frame++;
+  requestAnimationFrame(loop);
+}
+
+function draw() {
+  const c = cur.map(rgb);
+  ctx.save();
+  if (game.shake > 0) ctx.translate((Math.random() - 0.5) * game.shake * 2, (Math.random() - 0.5) * game.shake * 2);  // screen shake
+  drawBackground(c);
+  game.obstacles.forEach(o => drawObstacle(o, c[3]));
+  if (game.boss) drawBoss(game.boss);
+  game.players.forEach((p, i) => drawPlayer(p, i));
+  drawWeather();
+  ctx.restore();
+  drawHud();
+}
+
+// Flood = dark clouds + rising water + heavy rain + lightning flash.  Meteor shower = red sky.
+// Everything fades in and out smoothly (fade.storm and fade.meteor go from 0 to 1).
+function drawWeather() {
+  const S = fade.storm, M = fade.meteor;
+  if (S > 0.01) {
+    ctx.fillStyle = `rgba(25,35,70,${0.25 * S})`; ctx.fillRect(-10, -10, W + 20, H + 20);        // stormy dark sky
+    ctx.fillStyle = `rgba(33,150,243,${0.3 * S})`;                                                 // water rises and sinks
+    ctx.beginPath(); ctx.moveTo(-10, H);
+    for (let x = -10; x <= W + 10; x += 20) ctx.lineTo(x, GROUND + (1 - S) * 24 - 6 + Math.sin(x / 25 + frame / 8) * 4);
+    ctx.lineTo(W + 10, H); ctx.fill();
+    ctx.strokeStyle = `rgba(200,230,255,${0.65 * S})`; ctx.lineWidth = 1;                         // heavy rain
+    for (let k = 0; k < 90; k++) {
+      const x = (k * 53 + frame * 7) % (W + 40) - 20, y = (k * 37 + frame * 16) % H;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - 5, y + 12); ctx.stroke();
+    }
+    if (game.obstacles.some(o => o.type == 'lightning' && !o.warn)) {                              // the whole sky flashes
+      ctx.fillStyle = 'rgba(255,255,255,.5)'; ctx.fillRect(-10, -10, W + 20, H + 20);
+    }
+  }
+  if (M > 0.01) { ctx.fillStyle = `rgba(160,20,0,${0.18 * M})`; ctx.fillRect(-10, -10, W + 20, H + 20); }
+}
+
+function drawBackground(c) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);           // sky
+  g.addColorStop(0, c[0]); g.addColorStop(1, c[1]);
+  ctx.fillStyle = g; ctx.fillRect(-10, -10, W + 20, H + 20);
+
+  const A = fade.deco;                                              // each decoration fades in and out
+  if (A.sun > 0.01) { ctx.globalAlpha = A.sun; ctx.fillStyle = '#ffd54f'; circle(650, 55, 24); }   // sun
+  if (A.moon > 0.01) {                                                                              // moon + stars
+    ctx.globalAlpha = A.moon; ctx.fillStyle = '#fff';
+    for (let k = 0; k < 30; k++) ctx.fillRect((k * 97) % W, (k * 53) % 100, 2, 2);
+    ctx.fillStyle = '#f5f3d7'; circle(650, 55, 20);
+  }
+  [['snow', '#fff'], ['lava', '#ff8a3d']].forEach(([name, color]) => {                              // snow falls, embers rise
+    if (A[name] < 0.01) return;
+    ctx.globalAlpha = A[name]; ctx.fillStyle = color;
+    for (let k = 0; k < 40; k++) {
+      const x = ((k * 97 - game.distance * 0.2) % W + W) % W;
+      const move = (k * 37 + frame * (1 + k % 3)) % H;
+      ctx.fillRect(x, name == 'snow' ? move : H - move, 3, 3);
+    }
+  });
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = c[2]; ctx.fillRect(-10, GROUND, W + 20, H - GROUND + 10);   // ground
+  ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(0, GROUND, W, 2);
+  for (let k = 0; k < 14; k++) {                                   // small stones that move with the ground
+    ctx.fillRect(((k * 71 - game.distance) % W + W) % W, GROUND + 10 + (k * 13) % 26, 4, 2);
+  }
+
+  if (fade.cave > 0.02) {                                           // cave ceiling slides down smoothly
+    ctx.save(); ctx.globalAlpha = fade.cave; ctx.translate(0, -(1 - fade.cave) * 56);
+    ctx.fillStyle = '#0b0910'; ctx.fillRect(0, -20, W, 60);
+    const shift = game.distance % 36;
+    for (let x = -shift; x < W + 36; x += 36) {
+      ctx.beginPath(); ctx.moveTo(x, 40); ctx.lineTo(x + 36, 40); ctx.lineTo(x + 18, 54); ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+const PLAYER_COLORS = ['#e040fb', '#ffd600'];   // P1 = purple, P2 = gold (name, line and score text)
+
+// Three different nerd dinosaurs (all wear glasses):
+//   Rex    = green, round glasses, bow tie, orange back spikes
+//   Blaze  = red, square glasses, angry eyebrows, flame crest, headband, dark stripes
+//   Frosty = blue, round glasses, woolly hat, scarf, icy back spikes
+function drawPlayer(p, i) {
+  if (mode == 2) drawPlayerMark(p, i);
+  if (p.hurt && Math.floor(frame / 4) % 2) return;                 // blink after getting hurt
+  const x = p.x, fy = GROUND - p.y, s = p.skin;
+  const run = p.y > 0 ? 0 : Math.floor(frame / 10) % 2;            // legs: one step every 10 frames (slower)
+  const col = p.alive ? SKIN_COLORS[s] : '#888';
+  ctx.fillStyle = col;
+  if (!p.duck) {                                                   // standing / jumping
+    ctx.fillRect(x - 6, fy - 26, 12, 8);                           // tail
+    if (s == 1) { ctx.fillStyle = '#ffab00'; ctx.fillRect(x - 10, fy - 27, 5, 6); ctx.fillStyle = col; }   // Blaze: glowing tail tip
+    ctx.fillRect(x + 2, fy - 32, 24, 22);                          // body
+    ctx.fillRect(x + 24, fy - 22, 7, 5);                           // little arm
+    ctx.fillRect(x + 6, fy - 10, 8, 10 - run * 3); ctx.fillRect(x + 18, fy - 10, 8, 7 + run * 3);   // legs
+    spikes(x + 3, fy - 32, s);
+    ctx.fillStyle = col; circle(x + 22, fy - 38, 12); ctx.fillRect(x + 26, fy - 36, 10, 9);          // head + snout
+    ctx.fillStyle = s == 1 ? 'rgba(255,214,0,.55)' : 'rgba(255,255,255,.45)'; ctx.fillRect(x + 10, fy - 28, 14, 16);   // belly
+    if (s == 1) { ctx.fillStyle = 'rgba(0,0,0,.22)'; ctx.fillRect(x + 4, fy - 30, 3, 14); ctx.fillRect(x + 9, fy - 30, 3, 10); }
+    neckwear(s, x + 22, fy - 25);
+    face(x + 19, fy - 40, p.alive, s);
+    headgear(s, x + 22, fy - 38, 12);
+  } else {                                                         // ducking
+    ctx.fillRect(x - 8, fy - 18, 12, 7);
+    if (s == 1) { ctx.fillStyle = '#ffab00'; ctx.fillRect(x - 12, fy - 18, 5, 6); ctx.fillStyle = col; }
+    ctx.fillRect(x - 2, fy - 20, 34, 14);
+    ctx.fillRect(x + 6, fy - 8, 8, 8 - run * 3); ctx.fillRect(x + 18, fy - 8, 8, 5 + run * 3);
+    spikes(x + 2, fy - 20, s);
+    ctx.fillStyle = col; circle(x + 30, fy - 20, 10); ctx.fillRect(x + 34, fy - 20, 10, 8);
+    ctx.fillStyle = s == 1 ? 'rgba(255,214,0,.55)' : 'rgba(255,255,255,.45)'; ctx.fillRect(x + 8, fy - 14, 16, 8);
+    neckwear(s, x + 24, fy - 12);
+    face(x + 22, fy - 23, p.alive, s);
+    headgear(s, x + 30, fy - 20, 10);
+  }
+}
+
+// 2-player mode: a colored name above the dinosaur and a colored line on the ground under it
+function drawPlayerMark(p, i) {
+  const c = PLAYER_COLORS[i], x = p.x;
+  ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(x - 10, GROUND + 2 + i * 7, 56, 6);   // dark edge, so the line is easy to see
+  ctx.fillStyle = c; ctx.fillRect(x - 9, GROUND + 3 + i * 7, 54, 4);                     // P1 line is higher, P2 line is lower
+  const top = Math.max(16, GROUND - p.y - (p.duck ? 48 : 70));                          // the name follows the dinosaur
+  ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.65)';
+  ctx.strokeText(p.name, x + 17, top); ctx.fillStyle = c; ctx.fillText(p.name, x + 17, top);
+  ctx.beginPath(); ctx.moveTo(x + 12, top + 4); ctx.lineTo(x + 22, top + 4); ctx.lineTo(x + 17, top + 10); ctx.fill();   // little arrow
+}
+
+function spikes(x, y, skin) {
+  if (skin == 1) {                                                 // Blaze: tall flames
+    [['#ff6d00', 11], ['#ffee58', 6]].forEach(([color, h]) => {
+      ctx.fillStyle = color; ctx.beginPath();
+      for (let k = 0; k < 3; k++) { ctx.moveTo(x + k * 7 + (11 - h) / 2, y); ctx.lineTo(x + k * 7 + 4, y - h); ctx.lineTo(x + k * 7 + 8 - (11 - h) / 2, y); }
+      ctx.fill();
+    });
+    return;
+  }
+  const h = skin == 2 ? 9 : 6;                                     // Frosty: ice crystals, Rex: small orange spikes
+  ctx.fillStyle = skin == 2 ? '#e1f5fe' : '#ffb300'; ctx.beginPath();
+  for (let k = 0; k < 3; k++) { ctx.moveTo(x + k * 7, y); ctx.lineTo(x + k * 7 + 4, y - h); ctx.lineTo(x + k * 7 + 8, y); }
+  ctx.fill();
+}
+function neckwear(skin, cx, cy) {
+  if (skin == 0) bowTie(cx, cy);                                   // Rex: red bow tie
+  if (skin == 2) {                                                 // Frosty: white scarf with red stripes
+    ctx.fillStyle = '#fff'; ctx.fillRect(cx - 10, cy - 4, 20, 6); ctx.fillRect(cx - 8, cy, 5, 11);
+    ctx.fillStyle = '#e53935'; ctx.fillRect(cx - 5, cy - 4, 3, 6); ctx.fillRect(cx + 3, cy - 4, 3, 6); ctx.fillRect(cx - 8, cy + 5, 5, 2);
+  }
+}
+function headgear(skin, hx, hy, r) {
+  const top = hy - r;
+  if (skin == 1) {                                                 // Blaze: flame crest + yellow headband
+    ctx.fillStyle = '#ff6d00'; ctx.beginPath();
+    ctx.moveTo(hx - 9, top + 5); ctx.lineTo(hx - 7, top - 8); ctx.lineTo(hx - 3, top + 1); ctx.lineTo(hx, top - 11);
+    ctx.lineTo(hx + 4, top + 1); ctx.lineTo(hx + 7, top - 7); ctx.lineTo(hx + 9, top + 5); ctx.fill();
+    ctx.fillStyle = '#ffee58'; ctx.beginPath(); ctx.moveTo(hx - 3, top + 4); ctx.lineTo(hx, top - 5); ctx.lineTo(hx + 3, top + 4); ctx.fill();
+    ctx.fillStyle = '#ffd600'; ctx.fillRect(hx - r + 1, top + 3, r * 2 - 2, 3);
+  }
+  if (skin == 2) {                                                 // Frosty: woolly hat with a pom-pom
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(hx, top + 4, r - 1, Math.PI, 0); ctx.fill();
+    ctx.fillStyle = '#e53935'; ctx.fillRect(hx - r + 1, top + 3, r * 2 - 2, 4); circle(hx, top - 7, 3.5);
+  }
+}
+function bowTie(cx, cy) {
+  ctx.fillStyle = '#d32f2f'; ctx.beginPath();
+  ctx.moveTo(cx - 9, cy - 4); ctx.lineTo(cx, cy); ctx.lineTo(cx - 9, cy + 4);
+  ctx.moveTo(cx + 9, cy - 4); ctx.lineTo(cx, cy); ctx.lineTo(cx + 9, cy + 4);
+  ctx.fill(); ctx.fillRect(cx - 2, cy - 2, 4, 4);
+}
+function face(cx, cy, alive, skin) {
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 2; ctx.fillStyle = '#fff';
+  [cx - 1, cx + 9].forEach(lx => {                                 // glasses: square for Blaze, round for the others
+    ctx.beginPath();
+    if (skin == 1) ctx.rect(lx - 4, cy - 4, 8, 8); else ctx.arc(lx, cy, 4.5, 0, 7);
+    ctx.fill(); ctx.stroke();
+  });
+  ctx.fillStyle = alive ? '#000' : '#d32f2f';
+  if (alive) { ctx.fillRect(cx, cy - 1, 3, 3); ctx.fillRect(cx + 10, cy - 1, 3, 3); }                          // pupils
+  else { ctx.fillRect(cx - 3, cy - 1, 7, 2); ctx.fillRect(cx + 7, cy - 1, 7, 2); }                              // crashed: red dashes
+  if (skin == 1 && alive) {                                        // Blaze: angry eyebrows
+    ctx.strokeStyle = '#7f0000'; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.moveTo(cx - 6, cy - 8); ctx.lineTo(cx + 2, cy - 5); ctx.moveTo(cx + 12, cy - 8); ctx.lineTo(cx + 5, cy - 5); ctx.stroke();
+  }
+  ctx.fillStyle = 'rgba(255,105,135,.7)'; ctx.fillRect(cx - 5, cy + 6, 5, 3);                                   // blush
+  ctx.fillStyle = '#000'; ctx.fillRect(cx + 4, cy + 8, 6, 1.5);                                                 // smile
+}
+
+function drawObstacle(o, color) {
+  ctx.fillStyle = color;
+  if (o.type == 'wave') {
+    drawWave(o);
+  } else if (o.type == 'pond') {
+    drawPond(o);
+  } else if (o.type == 'meteor') {
+    if (o.warn) {                                // red warning where the meteor will crash
+      ctx.fillStyle = Math.floor(frame / 5) % 2 ? 'rgba(255,0,0,.8)' : 'rgba(255,0,0,.3)';
+      ctx.fillRect(o.tx - 21, GROUND - 4, 42, 5);
+      ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('!', o.tx, GROUND - 10);
+    } else {
+      const cx = o.x + o.w / 2, cy = o.y + o.h / 2, len = Math.hypot(o.vx, o.vy) || 1;
+      const ux = -o.vx / len, uy = -o.vy / len;                 // the fire trail goes backwards
+      ctx.fillStyle = 'rgba(255,140,0,.7)'; ctx.beginPath();
+      ctx.moveTo(cx - uy * 11, cy + ux * 11); ctx.lineTo(cx + uy * 11, cy - ux * 11); ctx.lineTo(cx + ux * 60, cy + uy * 60); ctx.fill();
+      ctx.fillStyle = '#5d4037'; circle(cx, cy, o.h / 2);
+      ctx.fillStyle = '#ff7043'; circle(cx - 4, cy + 4, 5);
+    }
+  } else if (o.type == 'lightning') {
+    if (o.warn) {                                // yellow warning: a bolt will strike here. Walk away!
+      ctx.fillStyle = 'rgba(255,235,59,.12)'; ctx.fillRect(o.x, 0, o.w, GROUND);
+      ctx.fillStyle = Math.floor(frame / 4) % 2 ? 'rgba(255,235,59,.9)' : 'rgba(255,235,59,.3)';
+      ctx.fillRect(o.x, GROUND - 4, o.w, 5);
+    } else drawBolt(o.x + o.w / 2);
+  } else if (o.type == 'backFireball') {
+    if (o.warn) {                                // arrow at the left edge shows the height of the fireball
+      ctx.fillStyle = Math.floor(frame / 5) % 2 ? '#ff5252' : '#ffab40';
+      ctx.beginPath(); ctx.moveTo(4, o.y); ctx.lineTo(30, o.y + o.h / 2); ctx.lineTo(4, o.y + o.h); ctx.fill();
+    } else {
+      ctx.fillStyle = 'rgba(255,152,0,.6)'; ctx.fillRect(o.x - 22, o.y + 4, 22, o.h - 8);
+      ctx.fillStyle = '#ff6d00'; circle(o.x + o.w / 2, o.y + o.h / 2, o.h / 2 + 2);
+      ctx.fillStyle = '#ffee58'; circle(o.x + o.w / 2 + 2, o.y + o.h / 2, o.h / 4);
+    }
+  } else if (o.type == 'cactus') {
+    const n = o.w > 40 ? 3 : 1, w = o.w / n;     // a group has 3 cacti
+    for (let j = 0; j < n; j++) {
+      const x = o.x + j * w;
+      ctx.fillRect(x + w * 0.3, o.y, w * 0.4, o.h);                                  // trunk
+      ctx.fillRect(x, o.y + o.h * 0.3, w * 0.35, 4); ctx.fillRect(x, o.y + o.h * 0.3 - 8, 4, 12);   // left arm
+      ctx.fillRect(x + w * 0.65, o.y + o.h * 0.5, w * 0.35, 4); ctx.fillRect(x + w - 4, o.y + o.h * 0.5 - 8, 4, 12); // right arm
+    }
+  } else if (o.type == 'bird' || o.type == 'bat') {
+    ctx.fillStyle = o.type == 'bat' ? '#7e57c2' : '#8d6e63';
+    ctx.fillRect(o.x + 8, o.y + 7, 20, 10); ctx.fillRect(o.x, o.y + 5, 10, 8); ctx.fillRect(o.x + 28, o.y + 8, 8, 4);
+    if (Math.floor(frame / 6) % 2) ctx.fillRect(o.x + 12, o.y - 6, 10, 8);    // wings go up and down
+    else ctx.fillRect(o.x + 12, o.y + 16, 10, 6);
+  } else if (o.type == 'rock') {
+    ctx.fillStyle = '#9e9e9e'; ctx.beginPath(); ctx.moveTo(o.x, o.y + o.h); ctx.lineTo(o.x + 4, o.y + 6);
+    ctx.lineTo(o.x + 14, o.y); ctx.lineTo(o.x + 24, o.y + 5); ctx.lineTo(o.x + o.w, o.y + o.h); ctx.fill();
+  } else if (o.type == 'stalactite') {
+    ctx.fillStyle = '#8e82a0'; ctx.beginPath(); ctx.moveTo(o.x, o.y); ctx.lineTo(o.x + o.w, o.y);
+    ctx.lineTo(o.x + o.w / 2, o.y + o.h); ctx.fill();
+  } else if (o.type == 'fireball') {
+    ctx.fillStyle = 'rgba(255,152,0,.6)'; ctx.fillRect(o.x + o.w / 2, o.y + 4, 22, o.h - 8);   // tail of fire
+    ctx.fillStyle = '#ff6d00'; circle(o.x + o.w / 2, o.y + o.h / 2, o.h / 2 + 2);
+    ctx.fillStyle = '#ffee58'; circle(o.x + o.w / 2 - 2, o.y + o.h / 2, o.h / 4);
+  }
+}
+
+// A detailed wave: 3 layers of water, moving ripples, white foam and flying drops
+function drawWave(o) {
+  const x = o.x, w = o.w, g = GROUND, top = o.y, h = o.h;
+  const hump = (inset, color) => {               // one layer of the wave
+    ctx.fillStyle = color; ctx.beginPath(); ctx.moveTo(x + inset, g);
+    ctx.bezierCurveTo(x + w * 0.1 + inset, top + h * 0.6, x + w * 0.25, top + inset, x + w * 0.5, top + inset);
+    ctx.bezierCurveTo(x + w * 0.8, top + inset, x + w * 0.85, g - h * 0.3, x + w - inset, g); ctx.fill();
+  };
+  hump(0, '#0d47a1'); hump(3, '#1976d2'); hump(8, '#42a5f5');
+  ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1.5;   // ripple lines that move inside the wave
+  for (let k = 1; k <= 2; k++) {
+    ctx.beginPath();
+    for (let i = 0; i <= 8; i++) {
+      const px = x + w * 0.15 + i * w * 0.09, py = g - k * h * 0.28 + Math.sin(i + frame / 6) * 2;
+      if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+    }
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#fff';                          // white foam on top + small drops flying up
+  for (let i = 0; i < 5; i++) circle(x + w * (0.25 + i * 0.12), top + 2 + Math.sin(frame / 5 + i) * 1.5, 3.2);
+  for (let i = 0; i < 3; i++) circle(x + w * (0.35 + i * 0.15), top - 4 - ((frame / 3 + i * 7) % 9), 1.5);
+}
+
+// A zigzag lightning bolt from the sky to the ground
+function drawBolt(cx) {
+  ctx.lineJoin = 'round';
+  [['rgba(255,255,150,.5)', 10], ['#fff', 3]].forEach(([color, width]) => {
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); ctx.moveTo(cx, -5);
+    for (let y = 20; y < GROUND; y += 20) ctx.lineTo(cx + Math.sin(y * 0.37 + cx) * 12, y);
+    ctx.lineTo(cx, GROUND); ctx.stroke();
+  });
+}
+
+// The crocodile pond: a hole with water and a hungry crocodile
+function drawPond(o) {
+  ctx.fillStyle = '#0d47a1'; ctx.fillRect(o.x, GROUND, o.w, H - GROUND);
+  ctx.fillStyle = '#42a5f5'; ctx.fillRect(o.x, GROUND, o.w, 4);
+  const cx = o.x + o.w / 2, open = Math.floor(frame / 15) % 2 ? 6 : 0;   // the jaws open and close
+  ctx.fillStyle = '#2e7d32'; ctx.fillRect(cx - 30, GROUND + 6, 62, 14);   // body
+  ctx.fillRect(cx - 44, GROUND + 2, 30, 7);                               // upper jaw
+  ctx.fillRect(cx - 44, GROUND + 11 + open, 28, 6);                       // lower jaw
+  ctx.fillStyle = '#fff'; for (let k = 0; k < 4; k++) ctx.fillRect(cx - 42 + k * 7, GROUND + 9, 3, 3 + open / 2);   // teeth
+  ctx.fillStyle = '#ffeb3b'; ctx.fillRect(cx - 18, GROUND - 2, 7, 7);     // eye
+  ctx.fillStyle = '#000'; ctx.fillRect(cx - 15, GROUND, 3, 4);
+}
+
+// One dragon. flip = true draws it looking to the right (the one that attacks from behind).
+function dragon(x, flip, mouthOpen) {
+  const y = 64 + Math.sin(frame / 10) * 4;
+  ctx.save();
+  if (flip) { ctx.translate(x, 0); ctx.scale(-1, 1); ctx.translate(-x, 0); }
+  ctx.fillStyle = '#b71c1c';
+  ctx.fillRect(x, y + 20, 90, 56); ctx.fillRect(x - 34, y + 8, 40, 30); ctx.fillRect(x + 84, y + 44, 36, 10);  // body, head, tail
+  ctx.fillRect(x + 10, y + 76, 16, 16); ctx.fillRect(x + 56, y + 76, 16, 16);                                  // legs
+  ctx.fillStyle = '#7f0000'; ctx.beginPath();                                                                  // wing
+  if (Math.floor(frame / 8) % 2) { ctx.moveTo(x + 20, y + 20); ctx.lineTo(x + 60, y + 20); ctx.lineTo(x + 50, y - 18); }
+  else { ctx.moveTo(x + 20, y + 30); ctx.lineTo(x + 60, y + 30); ctx.lineTo(x + 60, y + 64); }
+  ctx.fill();
+  ctx.fillStyle = '#ffd600'; ctx.fillRect(x - 24, y + 14, 8, 6); ctx.fillRect(x - 30, y + 2, 6, 8);            // eye, horn
+  ctx.fillStyle = mouthOpen ? '#ff6d00' : '#4e0000'; ctx.fillRect(x - 34, y + 28, 22, 8);                     // mouth glows before shooting
+  ctx.restore();
+}
+
+function drawBoss(b) {
+  dragon(b.x, false, b.mouthOpen);        // the dragon in front
+  dragon(b.backX, true, b.backOpen);      // the dragon behind (off-screen when it is not attacking)
+  ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(300, 34, 200, 10);                                            // boss timer bar
+  ctx.fillStyle = '#ff5252'; ctx.fillRect(300, 34, 200 * Math.max(0, 1 - b.time / b.duration), 10);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('FIRE DRAKE', 400, 31);
+}
+
+function drawHud() {
+  ctx.shadowColor = '#000'; ctx.shadowBlur = 4; ctx.fillStyle = '#fff'; ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(String(game.score).padStart(5, '0'), W - 12, 22);
+  ctx.textAlign = 'left';
+  game.players.forEach((p, i) => {
+    const name = mode == 2 ? p.name + ': ' + p.score : p.name;
+    ctx.fillStyle = mode == 2 ? PLAYER_COLORS[i] : '#fff'; ctx.fillText(name, 12, 22 + i * 18);
+    ctx.fillStyle = '#ff5252'; ctx.fillText('♥'.repeat(p.hearts) + '♡'.repeat(p.maxHearts - p.hearts), 24 + ctx.measureText(name).width, 22 + i * 18);   // hearts
+  });
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  if (game.state == 'play' && game.message) { ctx.font = 'bold 20px sans-serif'; ctx.fillText(game.message, W / 2, 110); }
+  ctx.shadowBlur = 0;
+
+  if (game.toast) {                                                  // achievement pop-up
+    ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'center';
+    const text = '\u{1F3C6} ' + game.toast, w = ctx.measureText(text).width + 28;
+    ctx.fillStyle = 'rgba(255,193,7,.95)'; ctx.fillRect(W / 2 - w / 2, 52, w, 28);
+    ctx.fillStyle = '#3e2723'; ctx.fillText(text, W / 2, 71);
+  }
+  if (game.paused) overlay(['Paused', 'Press P, Esc, or click to continue']);
+  if (game.state == 'menu') overlay(['DinoJump (Java + HTML)', 'Press Space, tap, or click Start']);
+  if (game.state == 'over') {
+    let result = 'Score: ' + game.score;
+    if (game.players.length == 2) {
+      const a = game.players[0].score, b = game.players[1].score;
+      result = a == b ? 'Draw!' : 'Player ' + (a > b ? 1 : 2) + ' wins!  (' + a + ' vs ' + b + ')';
+    }
+    overlay(['Game Over', result, 'Press Space or tap to play again']);
+  }
+}
+
+// ---------- small helpers ----------
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
+function eye(x, y, alive) {
+  ctx.fillStyle = '#fff'; ctx.fillRect(x, y, 6, 6);
+  ctx.fillStyle = alive ? '#000' : '#d32f2f'; ctx.fillRect(x + 3, y + 1, 3, 3);
+}
+function overlay(lines) {
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
+  lines.forEach((t, i) => { ctx.font = (i == 0 ? 'bold 30px' : '16px') + ' sans-serif'; ctx.fillText(t, W / 2, 85 + i * 30); });
+}
+
+loop();
+</script></body></html>

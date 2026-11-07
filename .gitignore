@@ -1,0 +1,16 @@
+# Compiled Java files
+*.class
+target/
+out/
+bin/
+build/
+
+# Editor and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# JavaScript dependencies (if added later)
+node_modules/
