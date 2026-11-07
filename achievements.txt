@@ -1,4 +1,0 @@
-dragon	1
-meteor	10
-storm	10
-croc	5

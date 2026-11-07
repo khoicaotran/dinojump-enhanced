@@ -1,5 +1,0 @@
-4388	Player 1	Normal
-3576	Player 1	Normal
-3566	Player 1	Normal
-3555	Player 1	Normal
-3518	Player 1	Normal
